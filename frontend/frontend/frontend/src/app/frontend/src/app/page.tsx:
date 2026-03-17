@@ -1,0 +1,297 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+
+const RPC_URL = process.env.NEXT_PUBLIC_GENLAYER_RPC_URL || 'https://studio.genlayer.com:8443/api';
+const CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '';
+
+async function readState(method: string): Promise<any> {
+  const res = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'gen_call',
+      params: [{ to: CONTRACT_ADDRESS, data: { method, args: [] } }, 'latest'],
+      id: 1,
+    }),
+  });
+  const json = await res.json();
+  return json?.result;
+}
+
+async function writeContract(method: string, args: any[], privateKey: string): Promise<string> {
+  const res = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'gen_sendTransaction',
+      params: [{ to: CONTRACT_ADDRESS, data: { method, args }, value: '0x0' }, privateKey],
+      id: 2,
+    }),
+  });
+  const json = await res.json();
+  return json?.result;
+}
+
+async function waitForTx(txHash: string): Promise<any> {
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    const res = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'gen_getTransactionReceipt',
+        params: [txHash],
+        id: 3,
+      }),
+    });
+    const json = await res.json();
+    const receipt = json?.result;
+    if (receipt && receipt.status === 'FINALIZED') return receipt;
+  }
+  return null;
+}
+
+const PRESET_CATEGORIES = [
+  'things you find in a kitchen',
+  'things that are blue',
+  'animals that can fly',
+  'things you do at the beach',
+  'things that are bigger than a car',
+  'things you find in space',
+  'things that make noise',
+  'things you can eat raw',
+];
+
+export default function WordDuel() {
+  const [category, setCategory] = useState('');
+  const [round, setRound] = useState(0);
+  const [score, setScore] = useState(0);
+  const [lastWord, setLastWord] = useState('');
+  const [lastResult, setLastResult] = useState<boolean | null>(null);
+  const [lastFeedback, setLastFeedback] = useState('');
+  const [inputWord, setInputWord] = useState('');
+  const [privateKey, setPrivateKey] = useState('');
+  const [newCategory, setNewCategory] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [loadingState, setLoadingState] = useState('');
+  const [txHash, setTxHash] = useState('');
+  const [error, setError] = useState('');
+  const [history, setHistory] = useState<{ word: string; result: boolean; feedback: string }[]>([]);
+  const [showKey, setShowKey] = useState(false);
+  const [activeTab, setActiveTab] = useState<'play' | 'category'>('play');
+
+  useEffect(() => {
+    if (CONTRACT_ADDRESS) loadState();
+  }, []);
+
+  async function loadState() {
+    try {
+      const [cat, r, s, lw, lr, lf] = await Promise.all([
+        readState('get_category'),
+        readState('get_round'),
+        readState('get_score'),
+        readState('get_last_word'),
+        readState('get_last_result'),
+        readState('get_last_feedback'),
+      ]);
+      setCategory(cat ?? '');
+      setRound(r ?? 0);
+      setScore(s ?? 0);
+      setLastWord(lw ?? '');
+      setLastResult(lw ? lr : null);
+      setLastFeedback(lf ?? '');
+    } catch (e) {
+      setError('Could not load contract state. Check your RPC URL and contract address.');
+    }
+  }
+
+  async function handleSubmitWord() {
+    if (!inputWord.trim()) return;
+    if (!privateKey.trim()) { setError('Enter your private key to send transactions.'); return; }
+    if (!CONTRACT_ADDRESS) { setError('Set NEXT_PUBLIC_CONTRACT_ADDRESS in your .env file.'); return; }
+    setLoading(true);
+    setError('');
+    setLoadingState('Sending transaction...');
+    try {
+      const hash = await writeContract('submit_word', [inputWord.trim()], privateKey);
+      setTxHash(hash);
+      setLoadingState('Waiting for AI consensus (30s–2min)...');
+      const receipt = await waitForTx(hash);
+      if (receipt) {
+        setLoadingState('Loading result...');
+        await loadState();
+        const lr = await readState('get_last_result');
+        const lf = await readState('get_last_feedback');
+        setHistory((prev) => [{ word: inputWord.trim(), result: lr, feedback: lf }, ...prev].slice(0, 10));
+        setInputWord('');
+      } else {
+        setError('Transaction timed out. Try checking the Studio logs.');
+      }
+    } catch (e: any) {
+      setError(e.message || 'Transaction failed.');
+    } finally {
+      setLoading(false);
+      setLoadingState('');
+    }
+  }
+
+  async function handleChangeCategory(cat: string) {
+    if (!cat.trim()) return;
+    if (!privateKey.trim()) { setError('Enter your private key.'); return; }
+    setLoading(true);
+    setError('');
+    setLoadingState('Changing category...');
+    try {
+      const hash = await writeContract('change_category', [cat.trim()], privateKey);
+      setTxHash(hash);
+      setLoadingState('Waiting for consensus...');
+      await waitForTx(hash);
+      await loadState();
+      setHistory([]);
+      setNewCategory('');
+    } catch (e: any) {
+      setError(e.message || 'Transaction failed.');
+    } finally {
+      setLoading(false);
+      setLoadingState('');
+    }
+  }
+
+  const accuracy = round > 0 ? Math.round((score / round) * 100) : 0;
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#050709', color: '#e2e8f0', fontFamily: "'Space Mono', monospace", position: 'relative', overflow: 'hidden' }}>
+      <div style={{ position: 'fixed', inset: 0, zIndex: 0, backgroundImage: 'linear-gradient(rgba(0,229,160,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,160,.025) 1px,transparent 1px)', backgroundSize: '44px 44px', pointerEvents: 'none' }} />
+      <div style={{ position: 'fixed', top: '-20%', left: '50%', transform: 'translateX(-50%)', width: '600px', height: '600px', borderRadius: '50%', background: 'radial-gradient(circle, rgba(0,229,160,.08) 0%, transparent 70%)', pointerEvents: 'none', zIndex: 0 }} />
+      <div style={{ position: 'relative', zIndex: 1 }}>
+        <header style={{ borderBottom: '1px solid #1e2635', padding: '18px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'rgba(10,12,16,.8)', backdropFilter: 'blur(12px)', position: 'sticky', top: 0, zIndex: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div style={{ width: '34px', height: '34px', background: '#00e5a0', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', boxShadow: '0 0 16px rgba(0,229,160,.5)' }}>⬡</div>
+            <div>
+              <div style={{ fontFamily: "'DM Serif Display', serif", fontSize: '18px' }}>Word <span style={{ color: '#00e5a0' }}>Duel</span></div>
+              <div style={{ fontSize: '8px', color: '#5a6a80', letterSpacing: '3px', textTransform: 'uppercase' }}>On-Chain AI Game · GenLayer</div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#00e5a0', boxShadow: '0 0 6px #00e5a0' }} />
+            <span style={{ fontSize: '10px', color: '#5a6a80' }}>Testnet Bradbury</span>
+          </div>
+        </header>
+        <main style={{ maxWidth: '860px', margin: '0 auto', padding: '32px 24px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px', marginBottom: '28px' }}>
+            {[{ label: 'Round', value: round, color: '#00e5a0' }, { label: 'Score', value: score, color: '#7b61ff' }, { label: 'Accuracy', value: accuracy + '%', color: '#f7c948' }].map((s) => (
+              <div key={s.label} style={{ background: '#0f1218', border: '1px solid #1e2635', borderRadius: '10px', padding: '16px', textAlign: 'center' }}>
+                <div style={{ fontSize: '28px', fontWeight: 700, color: s.color, marginBottom: '4px' }}>{s.value}</div>
+                <div style={{ fontSize: '9px', color: '#5a6a80', letterSpacing: '2px', textTransform: 'uppercase' }}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ background: 'linear-gradient(135deg, rgba(0,229,160,.08) 0%, rgba(123,97,255,.08) 100%)', border: '1px solid rgba(0,229,160,.2)', borderRadius: '12px', padding: '20px 24px', marginBottom: '28px', display: 'flex', alignItems: 'center', gap: '14px' }}>
+            <div style={{ fontSize: '24px' }}>🎯</div>
+            <div>
+              <div style={{ fontSize: '9px', color: '#5a6a80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '4px' }}>Current Category</div>
+              <div style={{ fontSize: '16px', fontWeight: 700, color: '#00e5a0' }}>{category || 'Loading...'}</div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: '4px', marginBottom: '20px' }}>
+            {(['play', 'category'] as const).map((t) => (
+              <button key={t} onClick={() => setActiveTab(t)} style={{ padding: '8px 18px', border: '1px solid', borderColor: activeTab === t ? '#00e5a0' : '#1e2635', borderRadius: '6px', background: activeTab === t ? 'rgba(0,229,160,.1)' : 'none', color: activeTab === t ? '#00e5a0' : '#5a6a80', fontFamily: "'Space Mono', monospace", fontSize: '11px', cursor: 'pointer', textTransform: 'capitalize' }}>{t === 'play' ? '🎮 Play' : '🔄 Change Category'}</button>
+            ))}
+          </div>
+          {activeTab === 'play' && (
+            <div>
+              <div style={{ background: '#0f1218', border: '1px solid #1e2635', borderRadius: '10px', padding: '20px', marginBottom: '16px' }}>
+                <div style={{ fontSize: '9px', color: '#5a6a80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '12px' }}>Submit a Word</div>
+                <div style={{ display: 'flex', gap: '10px' }}>
+                  <input value={inputWord} onChange={(e) => setInputWord(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleSubmitWord()} placeholder="type a word..." disabled={loading} style={{ flex: 1, background: '#161b24', border: '1px solid #1e2635', borderRadius: '7px', padding: '10px 14px', color: '#e2e8f0', fontFamily: "'Space Mono', monospace", fontSize: '13px', outline: 'none' }} />
+                  <button onClick={handleSubmitWord} disabled={loading || !inputWord.trim()} style={{ background: loading ? '#1e2635' : '#00e5a0', color: loading ? '#5a6a80' : '#000', border: 'none', borderRadius: '7px', padding: '10px 20px', fontFamily: "'Space Mono', monospace", fontSize: '11px', fontWeight: 700, cursor: loading ? 'not-allowed' : 'pointer' }}>{loading ? '...' : 'Submit'}</button>
+                </div>
+              </div>
+              {lastFeedback && !loading && (
+                <div style={{ background: lastResult ? 'rgba(0,229,160,.06)' : 'rgba(255,59,92,.06)', border: '1px solid ' + (lastResult ? 'rgba(0,229,160,.3)' : 'rgba(255,59,92,.3)'), borderRadius: '10px', padding: '16px 20px', marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '14px' }}>
+                  <div style={{ fontSize: '28px' }}>{lastResult ? '✅' : '❌'}</div>
+                  <div>
+                    <div style={{ fontSize: '13px', fontWeight: 700, marginBottom: '4px', color: lastResult ? '#00e5a0' : '#ff3b5c' }}>{lastResult ? 'PASS' : 'FAIL'} — "{lastWord}"</div>
+                    <div style={{ fontSize: '11px', color: '#94a3b8' }}>{lastFeedback}</div>
+                  </div>
+                </div>
+              )}
+              {loading && (
+                <div style={{ background: '#0f1218', border: '1px solid #1e2635', borderRadius: '10px', padding: '20px', marginBottom: '16px', textAlign: 'center' }}>
+                  <div style={{ fontSize: '22px', marginBottom: '10px' }}>⬡</div>
+                  <div style={{ fontSize: '11px', color: '#5a6a80' }}>{loadingState}</div>
+                  {txHash && <div style={{ fontSize: '9px', color: '#374a5e', marginTop: '6px', wordBreak: 'break-all' }}>tx: {txHash}</div>}
+                </div>
+              )}
+              {history.length > 0 && (
+                <div style={{ background: '#0f1218', border: '1px solid #1e2635', borderRadius: '10px', padding: '20px' }}>
+                  <div style={{ fontSize: '9px', color: '#5a6a80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '14px' }}>This Session</div>
+                  {history.map((h, i) => (
+                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '8px 0', borderBottom: i < history.length - 1 ? '1px solid #1e2635' : 'none', fontSize: '11px' }}>
+                      <span>{h.result ? '✅' : '❌'}</span>
+                      <span style={{ fontWeight: 700, color: h.result ? '#00e5a0' : '#ff3b5c', minWidth: '80px' }}>"{h.word}"</span>
+                      <span style={{ color: '#5a6a80', flex: 1 }}>{h.feedback}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {activeTab === 'category' && (
+            <div>
+              <div style={{ background: '#0f1218', border: '1px solid #1e2635', borderRadius: '10px', padding: '20px', marginBottom: '16px' }}>
+                <div style={{ fontSize: '9px', color: '#5a6a80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '12px' }}>Type a Custom Category</div>
+                <div style={{ display: 'flex', gap: '10px' }}>
+                  <input value={newCategory} onChange={(e) => setNewCategory(e.target.value)} placeholder="e.g. things you find on a pirate ship" disabled={loading} style={{ flex: 1, background: '#161b24', border: '1px solid #1e2635', borderRadius: '7px', padding: '10px 14px', color: '#e2e8f0', fontFamily: "'Space Mono', monospace", fontSize: '12px', outline: 'none' }} />
+                  <button onClick={() => handleChangeCategory(newCategory)} disabled={loading || !newCategory.trim()} style={{ background: '#7b61ff', color: '#fff', border: 'none', borderRadius: '7px', padding: '10px 18px', fontFamily: "'Space Mono', monospace", fontSize: '11px', fontWeight: 700, cursor: 'pointer' }}>Set</button>
+                </div>
+              </div>
+              <div style={{ background: '#0f1218', border: '1px solid #1e2635', borderRadius: '10px', padding: '20px' }}>
+                <div style={{ fontSize: '9px', color: '#5a6a80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '12px' }}>Preset Categories</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                  {PRESET_CATEGORIES.map((c) => (
+                    <button key={c} onClick={() => handleChangeCategory(c)} disabled={loading} style={{ padding: '6px 14px', background: '#161b24', border: '1px solid ' + (c === category ? '#00e5a0' : '#1e2635'), borderRadius: '20px', color: c === category ? '#00e5a0' : '#94a3b8', fontFamily: "'Space Mono', monospace", fontSize: '10px', cursor: 'pointer' }}>{c}</button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+          {error && <div style={{ marginTop: '16px', background: 'rgba(255,59,92,.06)', border: '1px solid rgba(255,59,92,.3)', borderRadius: '8px', padding: '12px 16px', fontSize: '11px', color: '#ff3b5c' }}>⚠ {error}</div>}
+          <div style={{ marginTop: '24px', background: '#0f1218', border: '1px solid #1e2635', borderRadius: '10px', padding: '20px' }}>
+            <div style={{ fontSize: '9px', color: '#5a6a80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '10px' }}>🔑 Wallet Private Key (testnet only)</div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <input type={showKey ? 'text' : 'password'} value={privateKey} onChange={(e) => setPrivateKey(e.target.value)} placeholder="0x... (testnet private key)" style={{ flex: 1, background: '#161b24', border: '1px solid #1e2635', borderRadius: '7px', padding: '9px 12px', color: '#e2e8f0', fontFamily: "'Space Mono', monospace", fontSize: '11px', outline: 'none' }} />
+              <button onClick={() => setShowKey(!showKey)} style={{ background: 'none', border: '1px solid #1e2635', borderRadius: '6px', color: '#5a6a80', padding: '8px 12px', cursor: 'pointer', fontSize: '11px', fontFamily: "'Space Mono', monospace" }}>{showKey ? 'Hide' : 'Show'}</button>
+            </div>
+            <div style={{ fontSize: '9px', color: '#374a5e', marginTop: '8px' }}>Use a testnet-only key. Never use a mainnet private key in a browser.</div>
+          </div>
+          <div style={{ marginTop: '24px', background: '#0f1218', border: '1px solid #1e2635', borderRadius: '10px', padding: '20px' }}>
+            <div style={{ fontSize: '9px', color: '#5a6a80', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '12px' }}>How It Works</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px' }}>
+              {[{ n: '1', t: 'Submit', d: 'Type a word and submit it on-chain' }, { n: '2', t: 'AI Consensus', d: '5 GenLayer validators each run an LLM to judge your word' }, { n: '3', t: 'Verdict', d: 'Majority consensus decides PASS or FAIL — recorded forever' }].map((s) => (
+                <div key={s.n} style={{ textAlign: 'center' }}>
+                  <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: 'rgba(0,229,160,.15)', border: '1px solid rgba(0,229,160,.3)', color: '#00e5a0', fontSize: '11px', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 8px' }}>{s.n}</div>
+                  <div style={{ fontSize: '11px', fontWeight: 700, marginBottom: '4px' }}>{s.t}</div>
+                  <div style={{ fontSize: '9px', color: '#5a6a80', lineHeight: '1.6' }}>{s.d}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </main>
+      </div>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Serif+Display:ital@0;1&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+        @keyframes rot { to{transform:rotate(360deg)} }
+        input::placeholder { color: #374a5e; }
+        ::-webkit-scrollbar { width: 3px; }
+        ::-webkit-scrollbar-thumb { background: #1e2635; border-radius: 2px; }
+      `}</style>
+    </div>
+  );
+}
